@@ -83,6 +83,9 @@ class StoredConversationFactory @JvmOverloads constructor(
     /**
      * Create a conversation with no default participants.
      *
+     * The backing session must already exist. This method has no owner to use
+     * for session creation; call [ChatSessionRepository.createSession] first.
+     *
      * Use [StoredConversation.addMessageFromTo] to specify from/to per message.
      */
     override fun create(id: String): Conversation {
