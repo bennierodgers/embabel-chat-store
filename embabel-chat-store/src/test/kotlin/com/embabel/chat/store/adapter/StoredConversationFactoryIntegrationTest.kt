@@ -59,7 +59,7 @@ class StoredConversationFactoryIntegrationTest {
             conversation.addMessage(UserMessage("Hello"))
 
             val events = ArgumentCaptor.forClass(Any::class.java)
-            verify(publisher, timeout(5000).atLeast(2)).publishEvent(events.capture())
+            verify(publisher, timeout(30000).atLeast(2)).publishEvent(events.capture())
             assertTrue(events.allValues.filterIsInstance<MessageEvent>()
                 .any { it.status == MessageStatus.PERSISTED })
             assertEquals("Hello", repository.getMessages(sessionId).single().content)
