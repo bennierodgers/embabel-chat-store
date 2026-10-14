@@ -27,6 +27,16 @@ conversation.addMessage(UserMessage("Hello!"))      // from=user, to=agent
 conversation.addMessage(AssistantMessage("Hi!"))    // from=agent, to=user
 ```
 
+`createForParticipants` creates the backing session when absent. An existing session is
+reused only when `user.id` matches its owner; its stored title is preserved.
+Passing another user for the same session ID
+throws `IllegalArgumentException`.
+
+The lookup and session creation are not atomic. Concurrent calls for the same new session
+ID can both call `createSession`, overwriting the title, `createdAt`, and `lastActivityAt`
+and publishing duplicate `SessionCreatedEvent`s. Avoid concurrently initializing the same
+session ID.
+
 ## Architecture
 
 ```

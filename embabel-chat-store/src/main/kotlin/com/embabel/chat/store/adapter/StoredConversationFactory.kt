@@ -152,6 +152,8 @@ class StoredConversationFactory @JvmOverloads constructor(
             it as? StoredUser
                 ?: throw IllegalArgumentException("agent must be a StoredUser for persistence. Got: ${it::class.simpleName}")
         }
+        // Concurrent calls for a new ID can both create the session, resetting its metadata
+        // and publishing duplicate SessionCreatedEvents. This lookup and creation are not atomic.
         val session = repository.findBySessionId(id).orElse(null)
             ?: repository.createSession(id, sessionUser, title)
         require(session.owner.id == sessionUser.id) {

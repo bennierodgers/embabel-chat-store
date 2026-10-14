@@ -22,7 +22,7 @@ import com.embabel.chat.store.TestApplication
 import com.embabel.chat.store.event.SessionEventAwaiter
 import com.embabel.chat.store.model.TestSessionUser
 import com.embabel.chat.store.repository.ChatSessionRepository
-import org.drivine.manager.GraphObjectManager
+import org.drivine.manager.StatelessGraphObjectManager
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
@@ -42,7 +42,7 @@ class StoredConversationFactoryIntegrationTest {
     private lateinit var repository: ChatSessionRepository
 
     @Autowired
-    private lateinit var graphObjectManager: GraphObjectManager
+    private lateinit var graphObjectManager: StatelessGraphObjectManager
 
     @Test
     fun `first message persists without explicitly creating a session`() {
