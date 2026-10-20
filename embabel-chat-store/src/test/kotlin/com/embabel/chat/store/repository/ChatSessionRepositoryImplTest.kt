@@ -19,12 +19,16 @@ import com.embabel.chat.MessageRole
 import com.embabel.chat.store.TestApplication
 import com.embabel.chat.store.model.AttachmentData
 import com.embabel.chat.store.model.AssetData
+import com.embabel.chat.store.model.DataAttachmentData
 import com.embabel.chat.store.model.MessageData
+import com.embabel.chat.store.model.SimpleStoredMessage
+import com.embabel.chat.store.model.StoredUser
 import com.embabel.chat.store.model.TestSessionUser
 import com.embabel.chat.store.util.UUIDv7
 import org.drivine.StaleObjectException
 import org.drivine.manager.PersistenceManager
 import org.drivine.manager.StatelessGraphObjectManager
+import org.drivine.manager.load
 import org.drivine.model.Stamps
 import org.drivine.query.QuerySpecification
 import org.junit.jupiter.api.Assertions.*
@@ -456,6 +460,154 @@ class ChatSessionRepositoryImplTest {
         assertEquals(testUser.id, summary!!.owner.id)
         assertEquals(2L, summary.messageCount)
     }
+
+    @Test
+    fun `a session summary names who started the session, the author of its first message`() {
+        val triage = TestSessionUser(UUIDv7.generateString(), "Triage").also { graphObjectManager.save(it) }
+        val mine = UUIDv7.generateString()
+        val theirs = UUIDv7.generateString()
+        val empty = UUIDv7.generateString()
+        listOf(mine, theirs, empty).forEach { chatSessionRepository.createSession(it, testUser) }
+        chatSessionRepository.addMessage(mine, MessageWrite(MessageData(UUIDv7.generateString(), MessageRole.USER, "hi", Instant.now()), testUser, listOf(triage)))
+        chatSessionRepository.addMessage(mine, MessageWrite(MessageData(UUIDv7.generateString(), MessageRole.ASSISTANT, "hello", Instant.now()), triage, listOf(testUser)))
+        chatSessionRepository.addMessage(theirs, MessageWrite(MessageData(UUIDv7.generateString(), MessageRole.USER, "Steward asks", Instant.now()), triage))
+        chatSessionRepository.addMessage(theirs, MessageWrite(MessageData(UUIDv7.generateString(), MessageRole.USER, "and I reply", Instant.now()), testUser))
+
+        val startedBy = chatSessionRepository.listSessionSummariesForUser(testUser.id)
+            .associate { it.session.sessionId to it.startedBy?.id }
+
+        assertEquals(testUser.id, startedBy[mine])
+        assertEquals(triage.id, startedBy[theirs])
+        assertNull(startedBy[empty])
+    }
+
+    @Test
+    fun `a session opened by a message with no author is started by whoever first wrote in it`() {
+        val greeted = UUIDv7.generateString()
+        val unattended = UUIDv7.generateString()
+        chatSessionRepository.createSessionWithMessage(greeted, testUser, null, MessageWrite(message(MessageRole.SYSTEM, "welcome")))
+        chatSessionRepository.addMessage(greeted, MessageWrite(message(MessageRole.USER, "hi"), testUser))
+        chatSessionRepository.createSessionWithMessage(unattended, testUser, null, MessageWrite(message(MessageRole.SYSTEM, "welcome")))
+
+        val startedBy = chatSessionRepository.listSessionSummariesForUser(testUser.id)
+            .associate { it.session.sessionId to it.startedBy?.id }
+
+        assertEquals(testUser.id, startedBy[greeted])
+        assertTrue(startedBy.containsKey(unattended))
+        assertNull(startedBy[unattended])
+    }
+
+    @Test
+    fun `a session's first message can be sent to several recipients and carry files and data`() {
+        val sessionId = UUIDv7.generateString()
+        val triage = TestSessionUser(UUIDv7.generateString(), "Triage").also { graphObjectManager.save(it) }
+        val steward = TestSessionUser(UUIDv7.generateString(), "Steward").also { graphObjectManager.save(it) }
+        val file = AttachmentData.of(
+            filename = "ledger.txt",
+            mimeType = "text/plain",
+            sizeBytes = 12,
+            contentHash = "b".repeat(64),
+            storageUri = "world://uploads/ledger.txt",
+        )
+        val record = DataAttachmentData.of(type = "entity", title = "Customer Northwind", json = """{"id":"c-1"}""")
+
+        chatSessionRepository.createSessionWithMessage(
+            sessionId,
+            testUser,
+            "Opened to two",
+            MessageWrite(
+                messageData = message(MessageRole.USER, "@Triage @Steward look at this"),
+                author = testUser,
+                recipients = listOf(triage, steward),
+                attachments = listOf(file),
+                dataAttachments = listOf(record),
+            ),
+        )
+
+        val reloaded = chatSessionRepository.getMessages(sessionId).single()
+        assertEquals(testUser.id, reloaded.author?.id)
+        assertEquals(setOf(triage.id, steward.id), reloaded.recipients.map { it.id }.toSet())
+        assertEquals(listOf(file.attachmentId), reloaded.attachments.map { it.attachmentId })
+        assertEquals(listOf(record.json), reloaded.dataAttachments.map { it.json })
+        assertEquals(testUser.id, chatSessionRepository.listSessionSummariesForUser(testUser.id)
+            .single { it.session.sessionId == sessionId }.startedBy?.id)
+    }
+
+    @Test
+    fun `a recipient named twice is stored once`() {
+        val sessionId = UUIDv7.generateString()
+        chatSessionRepository.createSession(sessionId, testUser)
+        val triage = TestSessionUser(UUIDv7.generateString(), "Triage").also { graphObjectManager.save(it) }
+
+        chatSessionRepository.addMessage(sessionId, MessageWrite(message(MessageRole.USER, "hi"), testUser, listOf(triage, triage)))
+
+        assertEquals(listOf(triage.id), chatSessionRepository.getMessages(sessionId).single().recipients.map { it.id })
+    }
+
+    @Test
+    fun `a repository without multi-party support takes a 1-1 write and refuses a multi-party one`() {
+        val delegate = chatSessionRepository
+        val legacy = object : ChatSessionRepository by delegate {
+            // Only the methods every implementation had before a message could have several
+            // recipients: the multi-party ones fall back to the interface defaults.
+            override fun addMessage(sessionId: String, write: MessageWrite) =
+                super<ChatSessionRepository>.addMessage(sessionId, write)
+
+            override fun createSessionWithMessage(sessionId: String, owner: StoredUser, title: String?, write: MessageWrite) =
+                super<ChatSessionRepository>.createSessionWithMessage(sessionId, owner, title, write)
+        }
+        val triage = TestSessionUser(UUIDv7.generateString(), "Triage").also { graphObjectManager.save(it) }
+        val sessionId = UUIDv7.generateString()
+
+        legacy.createSessionWithMessage(sessionId, testUser, null, MessageWrite(message(MessageRole.USER, "hi"), testUser, listOf(triage)))
+        legacy.addMessage(sessionId, MessageWrite(message(MessageRole.ASSISTANT, "hello"), triage, listOf(testUser)))
+
+        assertEquals(
+            listOf(listOf(triage.id), listOf(testUser.id)),
+            chatSessionRepository.getMessages(sessionId).map { message -> message.recipients.map { it.id } },
+        )
+        assertThrows(IllegalArgumentException::class.java) {
+            legacy.addMessage(sessionId, MessageWrite(message(MessageRole.USER, "both"), testUser, listOf(triage, testUser)))
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            legacy.addMessage(
+                sessionId,
+                MessageWrite(message(MessageRole.USER, "data"), testUser, dataAttachments = listOf(DataAttachmentData.of("view", "v", "{}"))),
+            )
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            legacy.createSessionWithMessage(
+                UUIDv7.generateString(), testUser, null,
+                MessageWrite(message(MessageRole.USER, "both"), testUser, listOf(triage, testUser)),
+            )
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            legacy.createSessionWithMessage(
+                UUIDv7.generateString(), testUser, null,
+                MessageWrite(
+                    message(MessageRole.USER, "file"), testUser,
+                    attachments = listOf(
+                        AttachmentData.of(
+                            filename = "a.txt",
+                            mimeType = "text/plain",
+                            sizeBytes = 1,
+                            contentHash = "c".repeat(64),
+                            storageUri = "world://uploads/a.txt",
+                        ),
+                    ),
+                ),
+            )
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            legacy.createSessionWithMessage(
+                UUIDv7.generateString(), testUser, null,
+                MessageWrite(message(MessageRole.USER, "data"), testUser, dataAttachments = listOf(DataAttachmentData.of("view", "v", "{}"))),
+            )
+        }
+    }
+
+    private fun message(role: MessageRole, content: String) =
+        MessageData(UUIDv7.generateString(), role, content, Instant.now())
 
     @Test
     fun `test session summary reports zero for a session with no messages`() {
@@ -1190,6 +1342,153 @@ class ChatSessionRepositoryImplTest {
         chatSessionRepository.deleteSession(sessionId)
 
         assertEquals(0, countNodes("StoredAsset", "storedAssetId", asset.storedAssetId))
+    }
+
+    @Test
+    fun `a message sent to several recipients keeps every one across a reload`() {
+        val sessionId = UUIDv7.generateString()
+        chatSessionRepository.createSession(sessionId, testUser)
+        val triage = TestSessionUser(UUIDv7.generateString(), "Triage").also { graphObjectManager.save(it) }
+        val steward = TestSessionUser(UUIDv7.generateString(), "Steward").also { graphObjectManager.save(it) }
+        val messageId = UUIDv7.generateString()
+
+        chatSessionRepository.addMessage(
+            sessionId,
+            MessageWrite(
+                messageData = MessageData(messageId, MessageRole.USER, "@Triage @Steward is this at risk?", Instant.now()),
+                author = testUser,
+                recipients = listOf(triage, steward),
+            ),
+        )
+
+        val reloaded = chatSessionRepository.getMessages(sessionId).single()
+        assertEquals(testUser.id, reloaded.author?.id)
+        assertEquals(setOf(triage.id, steward.id), reloaded.recipients.map { it.id }.toSet())
+    }
+
+    @Test
+    fun `data attachments survive a reload with their payload intact`() {
+        val sessionId = UUIDv7.generateString()
+        chatSessionRepository.createSession(sessionId, testUser)
+        val record = DataAttachmentData.of(
+            type = "entity",
+            title = "Customer Northwind",
+            json = """{"label":"Customer","id":"c-1","properties":{"name":"Northwind","risk":0.8}}""",
+        )
+
+        chatSessionRepository.addMessage(
+            sessionId,
+            MessageWrite(
+                messageData = MessageData(UUIDv7.generateString(), MessageRole.USER, "see attached", Instant.now()),
+                author = testUser,
+                dataAttachments = listOf(record),
+            ),
+        )
+
+        assertEquals(record, chatSessionRepository.getMessages(sessionId).single().dataAttachments.single())
+        assertEquals(1, countNodes("DataAttachment", "dataAttachmentId", record.dataAttachmentId))
+    }
+
+    @Test
+    fun `deleting a session deletes its data attachments and leaves the recipients`() {
+        val sessionId = UUIDv7.generateString()
+        chatSessionRepository.createSession(sessionId, testUser)
+        val triage = TestSessionUser(UUIDv7.generateString(), "Triage").also { graphObjectManager.save(it) }
+        val record = DataAttachmentData.of(type = "view", title = "Overdue invoices", json = """{"rows":[]}""")
+        chatSessionRepository.addMessage(
+            sessionId,
+            MessageWrite(
+                messageData = MessageData(UUIDv7.generateString(), MessageRole.USER, "please look", Instant.now()),
+                author = testUser,
+                recipients = listOf(triage),
+                dataAttachments = listOf(record),
+            ),
+        )
+
+        chatSessionRepository.deleteSession(sessionId)
+
+        assertEquals(0, countNodes("DataAttachment", "dataAttachmentId", record.dataAttachmentId))
+        assertEquals(1, countNodes("User", "id", triage.id))
+    }
+
+    @Test
+    fun `a message loaded on its own is built through its primary constructor, keeping every recipient`() {
+        // SimpleStoredMessage also has a deprecated (message, author, recipient) constructor. A
+        // load that picked it could hold one recipient at most.
+        val sessionId = UUIDv7.generateString()
+        chatSessionRepository.createSession(sessionId, testUser)
+        val triage = TestSessionUser(UUIDv7.generateString(), "Triage").also { graphObjectManager.save(it) }
+        val toBoth = message(MessageRole.USER, "both")
+        val toOne = message(MessageRole.ASSISTANT, "one")
+        chatSessionRepository.addMessage(sessionId, MessageWrite(toBoth, testUser, listOf(triage, testUser)))
+        chatSessionRepository.addMessage(sessionId, MessageWrite(toOne, triage, listOf(testUser)))
+
+        val both = graphObjectManager.load<SimpleStoredMessage>(toBoth.messageId)
+        val one = graphObjectManager.load<SimpleStoredMessage>(toOne.messageId)
+
+        assertEquals(setOf(triage.id, testUser.id), both?.recipients?.map { it.id }?.toSet())
+        assertEquals(listOf(testUser.id), one?.recipients?.map { it.id })
+        assertEquals(testUser.id, one?.recipient?.id)
+    }
+
+    @Test
+    fun `a repository without multi-party support takes one recipient named twice as one`() {
+        val delegate = chatSessionRepository
+        val legacy = object : ChatSessionRepository by delegate {
+            override fun addMessage(sessionId: String, write: MessageWrite) =
+                super<ChatSessionRepository>.addMessage(sessionId, write)
+
+            override fun createSessionWithMessage(sessionId: String, owner: StoredUser, title: String?, write: MessageWrite) =
+                super<ChatSessionRepository>.createSessionWithMessage(sessionId, owner, title, write)
+        }
+        val triage = TestSessionUser(UUIDv7.generateString(), "Triage").also { graphObjectManager.save(it) }
+        val sessionId = UUIDv7.generateString()
+
+        legacy.createSessionWithMessage(sessionId, testUser, null, MessageWrite(message(MessageRole.USER, "hi"), testUser, listOf(triage, triage)))
+        legacy.addMessage(sessionId, MessageWrite(message(MessageRole.ASSISTANT, "hello"), triage, listOf(testUser, testUser)))
+
+        assertEquals(
+            listOf(listOf(triage.id), listOf(testUser.id)),
+            chatSessionRepository.getMessages(sessionId).map { message -> message.recipients.map { it.id } },
+        )
+    }
+
+    @Test
+    fun `a data attachment ID used on two messages is one node, deleted with either session`() {
+        val first = UUIDv7.generateString()
+        val second = UUIDv7.generateString()
+        listOf(first, second).forEach { chatSessionRepository.createSession(it, testUser) }
+        val record = DataAttachmentData.of(type = "entity", title = "Shared", json = "{}")
+        listOf(first, second).forEach {
+            chatSessionRepository.addMessage(it, MessageWrite(message(MessageRole.USER, "see"), testUser, dataAttachments = listOf(record)))
+        }
+        assertEquals(1, countNodes("DataAttachment", "dataAttachmentId", record.dataAttachmentId))
+
+        chatSessionRepository.deleteSession(first)
+
+        assertEquals(emptyList<DataAttachmentData>(), chatSessionRepository.getMessages(second).single().dataAttachments)
+    }
+
+    @Test
+    fun `every author is a participant, agents included`() {
+        val sessionId = UUIDv7.generateString()
+        chatSessionRepository.createSession(sessionId, testUser)
+        val triage = TestSessionUser(UUIDv7.generateString(), "Triage").also { graphObjectManager.save(it) }
+        val question = UUIDv7.generateString()
+        chatSessionRepository.addMessage(
+            sessionId,
+            MessageWrite(MessageData(question, MessageRole.USER, "@Triage hi", Instant.now()), testUser, listOf(triage)),
+        )
+        chatSessionRepository.addMessage(
+            sessionId,
+            MessageWrite(
+                MessageData(UUIDv7.generateString(), MessageRole.ASSISTANT, "hello", Instant.now(), inReplyTo = question),
+                triage,
+                listOf(testUser),
+            ),
+        )
+
+        assertEquals(setOf(testUser.id, triage.id), chatSessionRepository.getParticipants(sessionId).map { it.id }.toSet())
     }
 
     /** Leaves the node as one stored before stamps were kept: with no stamp property. */

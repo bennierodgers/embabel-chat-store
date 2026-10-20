@@ -29,11 +29,13 @@ import com.embabel.chat.store.event.MessagePersistedEvent
 import com.embabel.chat.store.event.SessionEventAwaiter
 import com.embabel.chat.store.model.MessageData
 import com.embabel.chat.store.model.AssetData
+import com.embabel.chat.store.model.DataAttachmentData
 import com.embabel.chat.store.model.SessionData
 import com.embabel.chat.store.model.SimpleStoredMessage
 import com.embabel.chat.store.model.StoredSession
 import com.embabel.chat.store.model.StoredUser
 import com.embabel.chat.store.repository.ChatSessionRepository
+import com.embabel.chat.store.repository.MessageWrite
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -140,6 +142,158 @@ class StoredConversationTest {
         release.countDown()
         assertTrue(bothPersisted.await(5, TimeUnit.SECONDS))
         assertEquals(mapOf(question to null, reply to question), conversation.entries.associate { it.messageId to it.inReplyTo })
+    }
+
+    @Test
+    fun `entries name each message's author, recipients and data attachments, while pending and once persisted`() {
+        val triage = TestUser("agent-2", "Triage")
+        val record = DataAttachmentData.of(type = "entity", title = "Customer Northwind", json = """{"id":"c-1"}""")
+        val release = CountDownLatch(1)
+        val persistedLatch = CountDownLatch(1)
+        val persisted = CopyOnWriteArrayList<SimpleStoredMessage>()
+        whenever(repository.addMessage(eq(sessionId), any<MessageWrite>())).thenAnswer { call ->
+            release.await(5, TimeUnit.SECONDS)
+            val write = call.getArgument<MessageWrite>(1)
+            persisted += SimpleStoredMessage(
+                write.messageData,
+                author = write.author,
+                recipients = write.recipients,
+                dataAttachments = write.dataAttachments,
+            )
+            persistedLatch.countDown()
+            StoredSession(
+                session = SessionData(sessionId = sessionId, title = "Test", createdAt = Instant.now()),
+                owner = user,
+                messages = persisted.toList(),
+            )
+        }
+        whenever(repository.getMessages(sessionId)).thenAnswer { persisted.toList() }
+        val conversation = createConversation(title = "Test")
+
+        conversation.addAttributedMessage(
+            UserMessage(content = "@Bot @Triage look at this"),
+            from = user,
+            recipients = listOf(agent, triage),
+            dataAttachments = listOf(record),
+        )
+
+        fun describe(entry: ConversationEntry) =
+            Triple(entry.author?.id, entry.recipients.map { it.id }, entry.dataAttachments.map { it.dataAttachmentId })
+        val expected = Triple(user.id, listOf(agent.id, triage.id), listOf(record.dataAttachmentId))
+        assertEquals(expected, describe(conversation.entries.single()), "while pending")
+
+        release.countDown()
+        assertTrue(persistedLatch.await(5, TimeUnit.SECONDS))
+        verify(repository, timeout(2000)).addMessage(eq(sessionId), any<MessageWrite>())
+        assertEquals(expected, describe(conversation.entries.single()), "once persisted")
+    }
+
+    @Test
+    fun `a message to several recipients names the first on its MessageEvents and all of them once persisted`() {
+        val triage = TestUser("agent-2", "Triage")
+        whenever(repository.addMessage(eq(sessionId), any<MessageWrite>())).thenReturn(
+            StoredSession(
+                session = SessionData(sessionId = sessionId, title = "Test", createdAt = Instant.now()),
+                owner = user,
+                messages = listOf(SimpleStoredMessage(MessageData("m-1", MessageRole.USER, "hi", Instant.now()))),
+            )
+        )
+        val conversation = createConversation(title = "Test")
+
+        val messageId = conversation.addAttributedMessage(
+            UserMessage(content = "@Bot @Triage look"),
+            from = user,
+            recipients = listOf(agent, triage),
+        )
+
+        verify(eventPublisher, timeout(5000)).publishEvent(any<MessagePersistedEvent>())
+        val events = argumentCaptor<Any>()
+        verify(eventPublisher, atLeastOnce()).publishEvent(events.capture())
+        val persisted = events.allValues.filterIsInstance<MessagePersistedEvent>().single()
+        assertEquals(messageId, persisted.messageId)
+        assertEquals(user.id, persisted.authorId)
+        assertEquals(listOf(agent.id, triage.id), persisted.recipientIds)
+        assertEquals(
+            setOf(MessageStatus.ADDED to agent.id, MessageStatus.PERSISTED to agent.id),
+            events.allValues.filterIsInstance<MessageEvent>().map { it.status to it.toUserId }.toSet(),
+        )
+    }
+
+    @Test
+    fun `a 1-1 message names its author and its one recipient once persisted`() {
+        stubAddMessage(SimpleStoredMessage(MessageData("m-1", MessageRole.USER, "hi", Instant.now())))
+        val conversation = createConversation(title = "Test")
+
+        conversation.addMessage(UserMessage(content = "hi"))
+
+        verify(eventPublisher, timeout(5000)).publishEvent(any<MessagePersistedEvent>())
+        val events = argumentCaptor<Any>()
+        verify(eventPublisher, atLeastOnce()).publishEvent(events.capture())
+        val persisted = events.allValues.filterIsInstance<MessagePersistedEvent>().single()
+        assertEquals(user.id, persisted.authorId)
+        assertEquals(listOf(agent.id), persisted.recipientIds)
+    }
+
+    @Test
+    fun `a recipient named twice is sent the message once`() {
+        whenever(repository.addMessage(eq(sessionId), any<MessageWrite>())).thenThrow(RuntimeException("held pending"))
+        val conversation = createConversation(title = "Test")
+
+        conversation.addAttributedMessage(UserMessage(content = "hi"), from = user, recipients = listOf(agent, agent, user))
+
+        assertEquals(listOf(agent.id, user.id), conversation.entries.single().recipients.map { it.id })
+        val write = argumentCaptor<MessageWrite>()
+        verify(repository, timeout(2000)).addMessage(eq(sessionId), write.capture())
+        assertEquals(listOf(agent.id, user.id), write.firstValue.recipients.map { it.id })
+    }
+
+    @Test
+    fun `a message with one recipient and no data stays on the repository's original write`() {
+        stubAddMessage()
+        val conversation = createConversation(title = "Test")
+
+        conversation.addAttributedMessage(UserMessage(content = "hi"), from = user, recipients = listOf(agent))
+
+        verify(repository, timeout(2000)).addMessage(eq(sessionId), any(), eq(user), eq(agent), eq(emptyList()))
+        verify(repository, never()).addMessage(any(), any<MessageWrite>())
+    }
+
+    @Test
+    fun `a message with one recipient and data goes through the multi-party write`() {
+        whenever(repository.addMessage(eq(sessionId), any<MessageWrite>())).thenThrow(RuntimeException("held pending"))
+        val record = DataAttachmentData.of(type = "view", title = "v", json = "{}")
+        val conversation = createConversation(title = "Test")
+
+        conversation.addAttributedMessage(UserMessage(content = "hi"), from = user, recipients = listOf(agent), dataAttachments = listOf(record))
+
+        val write = argumentCaptor<MessageWrite>()
+        verify(repository, timeout(2000)).addMessage(eq(sessionId), write.capture())
+        assertEquals(listOf(record), write.firstValue.dataAttachments)
+        verify(repository, never()).addMessage(any(), any(), any(), any(), any())
+    }
+
+    @Test
+    fun `a multi-party message to a repository without multi-party support fails and stays pending`() {
+        val triage = TestUser("agent-2", "Triage")
+        whenever(repository.addMessage(eq(sessionId), any<MessageWrite>())).thenCallRealMethod()
+        whenever(repository.getMessages(sessionId)).thenReturn(emptyList())
+        val conversation = createConversation(title = "Test")
+
+        val messageId = conversation.addAttributedMessage(
+            UserMessage(content = "@Bot @Triage look"),
+            from = user,
+            recipients = listOf(agent, triage),
+        )
+
+        val events = argumentCaptor<Any>()
+        verify(eventPublisher, timeout(5000).times(2)).publishEvent(events.capture())
+        val failed = events.allValues.filterIsInstance<MessageEvent>().single { it.status == MessageStatus.PERSISTENCE_FAILED }
+        assertEquals(agent.id, failed.toUserId)
+        assertTrue(failed.error is IllegalArgumentException)
+        assertTrue(events.allValues.none { it is MessagePersistedEvent })
+        val pending = conversation.entries.single()
+        assertEquals(messageId, pending.messageId)
+        assertEquals(listOf(agent.id, triage.id), pending.recipients.map { it.id })
     }
 
     // ==================== Pending buffer tests ====================

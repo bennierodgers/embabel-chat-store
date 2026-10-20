@@ -137,6 +137,39 @@ interface ChatSessionRepository {
     }
 
     /**
+     * Create a new session with an initial message carrying everything [addMessage] taking a
+     * [MessageWrite] records: its author, every recipient, and its file and data attachments and
+     * assets.
+     *
+     * The default delegates to [createSessionWithMessageAndAssets] when there is at most one
+     * recipient (a recipient named twice counts once) and no file or data attachment, which that method has no way to carry, and
+     * rejects anything more unless the implementation supports it.
+     *
+     * @throws IllegalArgumentException when several recipients, file attachments or data
+     * attachments are supplied to an implementation that has not added support for them
+     */
+    fun createSessionWithMessage(
+        sessionId: String,
+        owner: StoredUser,
+        title: String?,
+        write: MessageWrite,
+    ): StoredSession {
+        val recipients = write.distinctRecipients
+        require(recipients.size <= 1 && write.attachments.isEmpty() && write.dataAttachments.isEmpty()) {
+            "This chat session repository does not support several recipients or attachments on a session's first message"
+        }
+        return createSessionWithMessageAndAssets(
+            sessionId = sessionId,
+            owner = owner,
+            title = title,
+            messageData = write.messageData,
+            messageAuthor = write.author,
+            messageRecipient = recipients.firstOrNull(),
+            assets = write.assets,
+        )
+    }
+
+    /**
      * Find a session by its ID.
      *
      * @param sessionId the session ID
@@ -262,6 +295,31 @@ interface ChatSessionRepository {
             author = author,
             recipient = recipient,
             attachments = attachments,
+        )
+    }
+
+    /**
+     * Add a message with everything a multi-party chat records about it: its author, every
+     * recipient it addresses, and its file and data attachments and assets.
+     *
+     * The default delegates to [addMessageWithAssets] when there is at most one recipient (a
+     * recipient named twice counts once) and no data attachment, and rejects anything more unless the implementation supports it.
+     *
+     * @throws IllegalArgumentException when several recipients or data attachments are
+     * supplied to an implementation that has not added multi-party support
+     */
+    fun addMessage(sessionId: String, write: MessageWrite): StoredSession {
+        val recipients = write.distinctRecipients
+        require(recipients.size <= 1 && write.dataAttachments.isEmpty()) {
+            "This chat session repository does not support several recipients or data attachments"
+        }
+        return addMessageWithAssets(
+            sessionId = sessionId,
+            messageData = write.messageData,
+            author = write.author,
+            recipient = recipients.firstOrNull(),
+            attachments = write.attachments,
+            assets = write.assets,
         )
     }
 
