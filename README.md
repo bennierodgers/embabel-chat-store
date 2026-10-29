@@ -1,13 +1,78 @@
-# Embabel Chat Store
+<a href="https://hub.embabel.com"><img align="left" src="https://raw.githubusercontent.com/embabel/guide/main/logo.png" width="240"></a>
 
-Conversation persistence layer for Embabel Agent. Provides pluggable storage backends
-for chat sessions — in-memory for development/testing, and a graph-database backing for
-production. Backed by Drivine and supports **Neo4j 5.x**, **Memgraph 2.x**, and
-**FalkorDB 4.x** out of the box; the matching dialect is detected automatically from
-Drivine's connection type. It also runs on **Oracle 23ai**, which Drivine reads with SQL/PGQ:
-see [Oracle](#oracle).
+### **Embabel Chat Store**
 
-## Quick Start
+![Build](https://github.com/embabel/embabel-chat-store/actions/workflows/maven.yml/badge.svg) [![Embabel](https://img.shields.io/badge/Embabel-Agent_Framework-6C3483?style=for-the-badge)](https://github.com/embabel/embabel-agent) ![Kotlin](https://img.shields.io/badge/kotlin-%237F52FF.svg?style=for-the-badge&logo=kotlin&logoColor=white) ![Spring](https://img.shields.io/badge/spring-%236DB33F.svg?style=for-the-badge&logo=spring&logoColor=white) ![Apache Maven](https://img.shields.io/badge/Apache%20Maven-C71A36?style=for-the-badge&logo=Apache%20Maven&logoColor=white)
+
+<br clear="left"/>
+
+Conversation persistence for the Embabel Agent framework: chat sessions, their messages, who sent
+each one to whom, attachments, structured data and assets, keyset paging, and a vector per message. It runs on five
+databases through [Drivine4j](https://github.com/liberation-data/drivine4j), and in memory for
+development and tests.
+
+## Supported databases
+
+| Database | Notes |
+|---|---|
+| **Neo4j** | The default for this repository's tests. The message vector index needs 5.13 or later. |
+| **FalkorDB** | Fastest on most workloads in [graph-bench](https://github.com/liberation-data/graph-bench). |
+| **Memgraph** | Use the `memgraph/memgraph-mage` image, which has the vector search module. |
+| **Oracle** ![New](https://img.shields.io/badge/NEW-ff3e00?style=flat-square) | Oracle Database 23ai or later. No Cypher: Drivine reads with SQL/PGQ and writes rows. Needs the JDBC driver. See [Oracle](#oracle). |
+| **Postgres** ![New](https://img.shields.io/badge/NEW-ff3e00?style=flat-square) | Postgres 14 or later. No Cypher: Drivine reads and writes with plain SQL, and searches vectors with pgvector. Needs the JDBC driver. See [Postgres](#postgres). |
+
+## See it running
+
+[Guide](https://github.com/embabel/guide) is a working reference: an Embabel agent that answers
+questions about Embabel from its documentation, and keeps its conversations in this store on any of
+Neo4j, FalkorDB, Memgraph, Oracle or Postgres.
+[Embabel Hub](https://hub.embabel.com) is its official front end.
+
+<p align="center">
+  <a href="https://www.youtube.com/watch?v=hY6ZFMIJdd4" target="_blank">
+    <img src="https://raw.githubusercontent.com/embabel/guide/main/guide-demo.png" alt="The Voice, The Word, and The Wheel" width="700">
+  </a>
+</p>
+
+## Usage
+
+Add the starter:
+
+```xml
+<dependency>
+    <groupId>com.embabel.agent</groupId>
+    <artifactId>embabel-agent-starter-chat-store</artifactId>
+    <version>0.7.0-SNAPSHOT</version>
+</dependency>
+```
+
+Configure a Drivine datasource:
+
+```yaml
+database:
+  datasources:
+    neo:
+      type: NEO4J          # or FALKORDB, MEMGRAPH; for ORACLE and POSTGRES see below
+      host: localhost
+      port: 7687
+      user-name: neo4j
+      password: secret
+      database-name: neo4j
+```
+
+Define the repository. The auto-configuration builds the conversation factories on it:
+
+```kotlin
+@Bean
+fun chatSessionRepository(
+    factory: GraphObjectManagerFactory,
+    persistenceManager: PersistenceManager,
+    eventPublisher: ApplicationEventPublisher,
+): ChatSessionRepository =
+    ChatSessionRepositoryImpl(factory.stateless(), persistenceManager, eventPublisher)
+```
+
+Then create a conversation and add messages:
 
 ```kotlin
 // Get a factory for your storage type
@@ -37,23 +102,111 @@ ID can both call `createSession`, overwriting the title, `createdAt`, and `lastA
 and publishing duplicate `SessionCreatedEvent`s. Avoid concurrently initializing the same
 session ID.
 
-## Architecture
+The database is whichever one the datasource names. Nothing database-specific is passed in, so moving
+from one to another is a configuration change.
+
+### Oracle
+
+Oracle Database 23ai or later. Oracle does not speak Cypher: Drivine reads it with
+SQL/PGQ and writes rows, and the repository is the same class as on the other databases.
+
+1. Add the JDBC driver. Drivine does not bring it:
+
+   ```xml
+   <dependency>
+       <groupId>com.oracle.database.jdbc</groupId>
+       <artifactId>ojdbc11</artifactId>
+   </dependency>
+   ```
+
+2. Point the datasource at the database:
+
+   ```yaml
+   database:
+     datasources:
+       neo:
+         type: ORACLE
+         host: localhost
+         port: 1521                  # the default
+         database-name: FREEPDB1     # the service to connect to
+         user-name: app
+         password: secret
+   ```
+
+   Drivine makes the graph's tables and the property graph over them in this user's schema, the first
+   time a manager speaks to the graph. The user needs the privileges to create them.
+
+3. Define the repository as above.
+
+### Postgres
+
+Postgres 14 or later. Postgres does not speak Cypher either: Drivine keeps the graph in tables of its
+own, reads and writes it with plain SQL, and the repository is the same class as on the other
+databases. The message vector index is an HNSW index of pgvector.
+
+1. Add the JDBC driver. Drivine does not bring it:
+
+   ```xml
+   <dependency>
+       <groupId>org.postgresql</groupId>
+       <artifactId>postgresql</artifactId>
+   </dependency>
+   ```
+
+2. Point the datasource at the database:
+
+   ```yaml
+   database:
+     datasources:
+       neo:
+         type: POSTGRES
+         host: localhost
+         port: 5432                  # the default
+         database-name: app          # the database to connect to
+         user-name: app
+         password: secret
+   ```
+
+   Drivine makes the graph's tables the first time a manager speaks to the graph, and the pgvector
+   extension where the server has it and the user may make it. Without pgvector everything works
+   except the message vector index and vector search, and the index cannot be made, so turn it off
+   with `embabel.chat.store.vector-index.enabled: false` or startup fails ensuring it.
+
+3. Define the repository as above.
+
+## How it works
 
 ```
 ConversationFactoryProvider
     ├── InMemoryConversationFactory  → InMemoryConversation  (ephemeral)
     └── StoredConversationFactory    → StoredConversation    (graph DB)
                                          │
-                                         ├── MessageEmbedder?      (optional: vector per message)
-                                         └── VectorIndexManager    (per-DB index DDL)
+                                         ├── ChatSessionRepository  (Drivine object manager)
+                                         └── MessageEmbedder?       (optional: vector per message)
 ```
-
-### Storage Types
 
 | Type | Class | Use Case |
 |------|-------|----------|
 | `IN_MEMORY` | `InMemoryConversation` | Testing, ephemeral chats |
 | `STORED` | `StoredConversation` | Production, persistent chats |
+
+A `StoredConversation` publishes each message as it is added, then persists it asynchronously
+through **`ChatSessionRepository`**: sessions, messages, paging, titles, narration and re-embedding.
+
+### Drivine
+
+The model is a set of Drivine `@NodeFragment`s (`ChatSession`, `StoredMessage`, `User`,
+`StoredAsset`, `DataAttachment`) and `@GraphView`s that load a node with what it is related to: a session
+with its owner and messages, a message with its author, recipients, attachments, data attachments and
+assets. `ChatSessionRepositoryImpl`
+reads and writes them through Drivine's `StatelessGraphObjectManager` and the query DSL Drivine
+generates at build time, so it holds no Cypher or SQL of its own. Drivine writes the statement for the
+configured database: Cypher for Neo4j, FalkorDB and Memgraph, SQL/PGQ for Oracle, plain SQL for Postgres.
+
+The schema is declared, not written: the constraints, the `lastActivityAt` and `kind` range indexes and the message
+vector index are Drivine `SchemaCatalog`s, and Drivine's schema manager creates each in the database's
+own form at startup. A load or a save is one statement and one round trip however many relationships it
+carries.
 
 ## Durable Assistant Assets
 
@@ -108,10 +261,14 @@ fun onMessage(event: MessageEvent) {
 |-------|-------------|
 | `conversationId` | Session ID |
 | `fromUserId` | Who sent the message |
-| `toUserId` | Who should receive it (for routing) |
+| `toUserId` | Who should receive it (for routing). A message sent to several recipients names the first |
 | `title` | Session title (for UI display) |
 | `message` | The message content |
 | `status` | ADDED, PERSISTED, or PERSISTENCE_FAILED |
+
+`MessageEvent` has room for one recipient. Once a message is persisted, a `MessagePersistedEvent`
+follows with its ID, its `authorId` and every one of its `recipientIds`, for listeners that route a
+multi-party message to each recipient.
 
 ## Message Attribution
 
@@ -119,7 +276,7 @@ Messages have explicit sender and recipient:
 
 ```
 (message:StoredMessage)-[:AUTHORED_BY]->(from:User)
-(message:StoredMessage)-[:SENT_TO]->(to:User)
+(message:StoredMessage)-[:SENT_TO]->(to:User)          // one per recipient
 ```
 
 ### Role-Based Routing (1-1 Chats)
@@ -169,13 +326,126 @@ conversation.addMessageFromTo(
 )
 ```
 
-#### Future Enhancements
+#### Several recipients and structured data
 
-Planned support for:
-- Group recipients (send to multiple users at once)
-- Participant lists on conversations
-- Agent-to-agent communication patterns
-- Broadcast messages
+`addAttributedMessage` names the author and every recipient of a message, and can attach structured
+data as well as files. It returns the message's ID:
+
+```kotlin
+val conversation = factory.create(sessionId) as StoredConversation
+
+val record = DataAttachmentData.of(
+    type = "entity",                      // the host's own vocabulary
+    title = "Customer Northwind",
+    json = """{"id":"c-1","risk":0.8}""",
+)
+val questionId = conversation.addAttributedMessage(
+    UserMessage("@Triage @Steward is this customer at risk?"),
+    from = alice,
+    recipients = listOf(triageAgent, stewardAgent),
+    dataAttachments = listOf(record),
+)
+conversation.addAttributedMessage(
+    AssistantMessage("Yes, three invoices are overdue."),
+    from = triageAgent,
+    recipients = listOf(alice),
+    inReplyTo = questionId,
+)
+
+conversation.entries.forEach { entry ->
+    println("${entry.author?.displayName} -> ${entry.recipients.map { it.displayName }}: ${entry.message.content}")
+}
+```
+
+A data attachment is stored in the graph with its message (`HAS_DATA_ATTACHMENT`), and is deleted
+with its session. Its `type` and `json` are opaque to the store. Make one per message:
+`DataAttachmentData.of` gives each a new ID, and an ID used on two messages is one node, deleted with
+either session. A message read back lists its
+recipients in no particular order.
+
+`ChatSessionRepository.addMessage(sessionId, MessageWrite(...))` and
+`createSessionWithMessage(sessionId, owner, title, MessageWrite(...))` write the same at the
+repository level. A custom `ChatSessionRepository` that implements neither still takes a message with
+one recipient and no data attachment through them (and, for `createSessionWithMessage`, no file
+attachment), and refuses anything more with `IllegalArgumentException`.
+
+#### Who took part
+
+- `ChatSessionRepository.getParticipants(sessionId)` lists everyone who wrote in a session.
+- `SessionSummary.startedBy` is the author of the earliest message that has one, read in the same
+  query as the rest of the summary. A message with no author, such as a system greeting, is passed
+  over; a session in which nobody has written yet has none.
+
+## Kinds of Session, and Sessions Within Sessions
+
+A session's ID is an opaque UUIDv7 and says nothing about the session. What a session is lives in
+the graph: its `kind`, the session it is `PART_OF`, and the user it is held `WITH`.
+
+```mermaid
+flowchart LR
+    owner(["User<br/>(the person)"])
+    agent(["User<br/>(an agent)"])
+    thread["ChatSession<br/>kind: thread"]
+    side["ChatSession<br/>kind: chat"]
+    msg["StoredMessage"]
+
+    thread -- OWNED_BY --> owner
+    side -- OWNED_BY --> owner
+    side -- PART_OF --> thread
+    side -- WITH --> agent
+    thread -- HAS_MESSAGE --> msg
+    msg -- AUTHORED_BY --> agent
+    msg -- SENT_TO --> agent
+```
+
+Don't put meaning in a session ID, such as a `th_` prefix for a thread: a prefixed ID is no longer
+time-ordered, so it breaks `SessionOrder.CREATED`, and what it says can't change without changing the
+ID. All three of `kind`, `PART_OF` and `WITH` are set when a session is created and never change:
+
+```kotlin
+repository.createSession(threadId, owner, "Planning", SessionWrite(kind = "thread"))
+```
+
+- **`kind`** is any string the app chooses, `chat` (`SessionData.DEFAULT_KIND`) unless given.
+- **`PART_OF`** links a session to the one it belongs to, such as an agent's private conversation
+  inside a thread. The session it is part of must exist, must itself be top-level, and must have the
+  same owner.
+- **`WITH`** links a session to the one user it is held with, such as that agent.
+
+An agent's conversation inside a thread is found again by the thread and the agent, and made the
+first time:
+
+```kotlin
+val side = repository.findOrCreatePart(partOf = threadId, heldWith = agent)   // owned by the thread's owner
+repository.findPart(threadId, agent.id)                                   // Optional, never creates
+repository.listParts(threadId)                                            // every part, as summaries
+```
+
+No database can make the (thread, agent) pair unique, so two callers at once can each make one.
+Every lookup returns the earliest, so they settle on the same session.
+
+**Listings.** `listSessionsForUser`, `listSessionSummariesForUser` and `countSessionsForUser` return
+top-level sessions only, so side conversations don't crowd the owner's list, and a count always matches
+its list. Pass a `SessionFilter` to choose a kind or to include the sessions that are part of another,
+as a parameter or as `SessionPageRequest.filter`:
+
+```kotlin
+repository.listSessionSummariesForUser(userId, SessionOrder.LAST_ACTIVITY, SessionFilter(kind = "thread"))
+repository.countSessionsForUser(userId, SessionFilter(includeParts = true))
+```
+
+**Deleting** a session deletes the sessions that are part of it, with their messages. The users they
+are owned by, held with or written by are kept. Since a session is part of a top-level session only,
+the delete reaches one level; if something written below the repository ever nested a session deeper,
+the delete is refused before anything is written rather than leaving that session behind.
+
+**Upgrading.** A session stored before `kind` existed reads as `chat`, and a filter for `chat` returns
+it, so nothing needs to run first. `ChatSessionRepository.backfillSessionKinds()` writes the value onto
+such sessions a page at a time; it is safe to run again, and returns how many it wrote.
+
+A custom `ChatSessionRepository` keeps compiling: the new methods have defaults. It takes only
+`SessionWrite.DEFAULT`, finds no parts, and refuses `findOrCreatePart` with
+`UnsupportedOperationException`.
 
 ## Sorting and Pagination
 
@@ -231,8 +501,8 @@ do {
 ```
 
 `nextCursor` is null on the last page. Use `listSessionSummariesForUser` for the same paging
-over lightweight summaries — owner plus a message count computed in the query, without
-loading message bodies.
+over lightweight summaries — owner, a message count and who started the session, computed in the
+query, without loading message bodies.
 
 Cursors are **opaque**: a versioned, Base64URL-encoded binary payload. Do not parse or
 construct them. Each cursor also records the `SessionOrder` that issued it, and is rejected
@@ -299,19 +569,6 @@ Without it, a save of an object loaded before the statement ran overwrites what 
 The repository itself writes no Cypher: each of its reads and writes goes through Drivine's
 object manager, which marks the stamp and runs on every store Drivine supports.
 
-## Oracle
-
-Oracle does not speak Cypher, and the repository sends it none. Configure the datasource as
-Drivine's README describes (`type: ORACLE`), and add the driver,
-`com.oracle.database.jdbc:ojdbc11`, which Drivine does not bring.
-
-The repository's Oracle tests start Oracle Free in a container, and run only when asked for,
-since the image is large and the database wants two gigabytes:
-
-```bash
-ORACLE_TESTS=true mvn -pl embabel-chat-store test -Dtest=ChatSessionRepositoryOracleTest
-```
-
 ### Upgrading from before stamps
 
 `ChatSessionRepositoryImpl` takes a `StatelessGraphObjectManager`, where it took a
@@ -364,7 +621,7 @@ The embedding is stored as two properties on the `:StoredMessage` node:
 ```cypher
 (msg:StoredMessage {
   messageId, role, content, createdAt,
-  embedding,                          // List<Float> — works on Neo4j/Memgraph/FalkorDB
+  embedding,                          // List<Float>
   embeddingModel                      // EmbeddingService.name, for drift detection
 })
 ```
@@ -404,9 +661,8 @@ embedding. Messages are never lost because an embedding call failed.
 
 ## Vector Index Management
 
-The chat-store creates and manages a vector index on `:StoredMessage(embedding)`
-automatically at application startup. The dialect (Neo4j / Memgraph / FalkorDB) is
-detected from Drivine's `PersistenceManager.type`.
+The chat store declares a vector index on `:StoredMessage(embedding)` as a Drivine `SchemaCatalog`,
+and Drivine's schema manager ensures it at startup, in the form the configured database takes.
 
 ```yaml
 embabel:
@@ -417,68 +673,30 @@ embabel:
         label: StoredMessage            # default
         property: embedding             # default
         similarity-function: cosine     # cosine | euclidean
-        name: null                      # default: ${label}_${property}_vector
+        name: null                      # default: Drivine derives one from label and property
 ```
 
-On startup the autoconfig calls `VectorIndexManager.ensureIndex(...)` with the
-dimensions taken from the configured `EmbeddingService.dimensions`. The call is
-idempotent — three outcomes:
+The index is sized to the embedding model's dimensions and versioned by the model's name. With no
+embedding model configured, no index is declared, since an index at the wrong width would accept
+writes. Ensuring is idempotent: a matching index is left alone, and an index of a different shape is
+reported as drift, not dropped.
 
-| Outcome | Meaning |
-|---|---|
-| `Created` | No prior index existed; one was created. Logged at INFO. |
-| `AlreadyMatching` | An index with the requested shape was already present. Logged at DEBUG. |
-| `Drift` | An index exists with a **different** shape (e.g. different dimensions). **Not auto-dropped.** Logged at WARN. |
+### Changing the embedding model
 
-### Handling Drift
-
-When you change the embedding model — say from `text-embedding-3-small` (1536 dims) to
-`text-embedding-3-large` (3072 dims) — `ensureIndex` will detect that the existing
-index no longer matches and emit a warning. To resolve:
+Re-embed the stored messages with the new model:
 
 ```kotlin
-@Autowired lateinit var indexManager: VectorIndexManager
-
-// Destructive — drops the old index, creates one for the new model.
-// Existing :StoredMessage.embedding values are now stale and must be re-embedded.
-indexManager.recreateIndex(
-    VectorIndexConfig(
-        label = "StoredMessage",
-        property = "embedding",
-        dimensions = newDimensions,
-    )
-)
+messageReembedder.reembed(embeddingService)
 ```
 
-Re-embedding existing messages is the caller's responsibility — the manager only
-handles the index itself.
-
-### Supported Databases
-
-| Database | Index DDL | Has index name? | `IF NOT EXISTS` |
-|---|---|---|---|
-| Neo4j 5.13+ | `CREATE VECTOR INDEX … OPTIONS { indexConfig: { … } }` | Yes | Yes |
-| Memgraph 2.x | `CREATE VECTOR INDEX … WITH CONFIG { dimension, metric, capacity }` | Yes | No — guarded via `vector_search.show_index_info()` |
-| FalkorDB 4.x | `CREATE VECTOR INDEX FOR (n:L) ON (n.p) OPTIONS { … }` | No (label+property identifies) | No — guarded via `db.indexes()` |
-
-Override the auto-selected manager by defining your own `VectorIndexManager` bean.
-
-### Test Coverage of the Index Managers
-
-| Database | Test coverage |
-|---|---|
-| Neo4j | Real Drivine testcontainer integration tests cover create / dedupe / drift detect / recreate / drop / named index / euclidean similarity. |
-| Memgraph | Cypher-capture unit tests only — they verify the emitted `WITH CONFIG`, metric mapping, and introspection-row parsing, but do not run against a real Memgraph. |
-| FalkorDB | Cypher-capture unit tests only — they verify the emitted `OPTIONS`, the bare-identifier keys, and `db.indexes()` row parsing, but do not run against a real FalkorDB. **The exact shape of the `options` map returned by `db.indexes()` for vector indexes is not fully documented upstream**; verify against a live FalkorDB the first time drift detection is exercised on it. The failure mode is fail-closed (`findIndex` returns null), which on `ensureIndex` produces an explicit FalkorDB-side error on the duplicate CREATE rather than a silent mismatch. |
-
-Adding real-backend integration tests for Memgraph and FalkorDB is tracked as
-a follow-up — `drivine4j` has examples for both.
+`MessageReembedder` remakes the vector index from the same spec the startup catalog uses, so the two
+cannot describe different indexes.
 
 ## User Implementation
 
 Implement `StoredUser` for your user type. The `StoredUser` interface extends `User` from
 `embabel-agent-api` with Drivine annotations for graph-database persistence (the same
-annotations work for Neo4j, Memgraph, and FalkorDB):
+annotations work on every supported database):
 
 ```kotlin
 @NodeFragment(labels = ["User", "MyUser"])
@@ -490,15 +708,19 @@ data class MyUser(
 ) : StoredUser
 ```
 
-Register with Drivine for polymorphic loading:
+Register it with Drivine, so a `User` node with the `MyUser` label loads as a `MyUser`:
 
 ```kotlin
 persistenceManager.registerSubtype(
     StoredUser::class.java,
-    "MyUser|User",  // Labels sorted alphabetically
-    MyUser::class.java
+    listOf("User", "MyUser"),   // the subtype's labels, in any order
+    MyUser::class.java,
 )
 ```
+
+Drivine registers subtypes itself only for a sealed class or a base type annotated with
+`@JsonSubTypes`. `StoredUser` is an interface applications implement, so it is neither, and an
+implementation needs this call.
 
 For simple cases without extra fields, use the built-in `SimpleStoredUser`:
 
@@ -522,7 +744,7 @@ embabel:
       enabled: true                  # default
       title-after-message-count: 1   # default: regenerate title every N messages
       vector-index:
-        enabled: true                # default: ensure a vector index at startup
+        enabled: true                # default: declare the message vector index
         similarity-function: cosine  # default
 ```
 
@@ -535,13 +757,29 @@ Beans auto-configured:
 | `conversationFactoryProvider` | — | Aggregates all factories |
 | `titleGenerator` | `Ai` bean | LLM-driven title generation |
 | `messageEmbedder` | `Ai` bean | Inline embedding on persisted messages |
-| `vectorIndexManager` | `PersistenceManager` | Per-DB vector-index DDL (auto-selected from `DatabaseType`) |
-| `vectorIndexEnsurer` | `VectorIndexManager` + `Ai` + property | Runs `ensureIndex` on app startup |
+| `chatStoreConstraintSchema` | — | Uniqueness constraints and the `lastActivityAt` range index |
+| `chatStoreVectorIndexSchema` | `Ai` bean + property | The message vector index, at the embedding model's width |
+| `messageReembedder` | `ChatSessionRepository` | Re-embeds messages and remakes the vector index |
+| `sessionEventAwaiter` | — | Waits on a session's persistence events |
 
 Each of these can be overridden by defining your own bean of the same type.
+
+## Testing
+
+Integration tests use Testcontainers, on Neo4j, Oracle Free and Postgres with pgvector:
+
+```bash
+mvn test
+```
+
+The Oracle image is large and the database wants two gigabytes. To run one store's tests alone:
+
+```bash
+mvn -pl embabel-chat-store test -Dtest='*OracleTest'      # or '*PostgresTest'
+```
 
 ## Dependencies
 
 - `embabel-agent-api` - Core conversation interfaces
-- `drivine` - Neo4j graph persistence
+- `drivine` - graph persistence on Neo4j, FalkorDB, Memgraph, Oracle and Postgres
 - Spring Boot (optional, for auto-configuration)

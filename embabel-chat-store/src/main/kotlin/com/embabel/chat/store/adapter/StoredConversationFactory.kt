@@ -42,23 +42,17 @@ import org.springframework.context.ApplicationEventPublisher
  * conversation.addMessage(assistantMessage)  // from=assistant, to=human
  * ```
  *
- * **Multi-party chats** (explicit from/to per message):
+ * **Multi-party chats** (explicit author and recipients per message):
  * ```kotlin
  * val conversation = factory.create(sessionId) as StoredConversation
  * conversation.addMessageFromTo(message, from = alice, to = bob)
- * conversation.addMessageFromTo(message, from = agent1, to = agent2)
+ * conversation.addAttributedMessage(message, from = alice, recipients = listOf(agent1, agent2))
  * ```
  *
- * ## Future: Multi-User and Multi-Agent Support
- *
- * The current model supports 1-1 chats with default user/agent participants.
- * For multi-party scenarios, use [StoredConversation.addMessageFromTo] with explicit
- * from/to per message.
- *
- * Planned enhancements:
- * - Group recipients (send to multiple users)
- * - Participant lists on conversations
- * - Agent-to-agent communication patterns
+ * [StoredConversation.entries] says who wrote each message and who it was sent to. A session's
+ * participants are everyone who wrote in it ([ChatSessionRepository.getParticipants]), and who
+ * started it is the author of its earliest message that has one
+ * ([com.embabel.chat.store.model.SessionSummary.startedBy]).
  *
  * @param repository the repository for persistence operations
  * @param sessionEventAwaiter awaiter for handling session creation race conditions
@@ -86,7 +80,8 @@ class StoredConversationFactory @JvmOverloads constructor(
      * The backing session must already exist. This method has no owner to use
      * for session creation; call [ChatSessionRepository.createSession] first.
      *
-     * Use [StoredConversation.addMessageFromTo] to specify from/to per message.
+     * Use [StoredConversation.addMessageFromTo] to specify from/to per message, or
+     * [StoredConversation.addAttributedMessage] for a message sent to several recipients.
      */
     override fun create(id: String): Conversation {
         return createInternal(id, user = null, agent = null)
